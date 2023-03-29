@@ -74,6 +74,9 @@ import com.hazelcast.security.TokenCredentials;
 import com.hazelcast.spi.exception.TargetDisconnectedException;
 import com.hazelcast.spi.properties.HazelcastProperties;
 import com.hazelcast.sql.impl.QueryUtils;
+import org.crac.CheckpointException;
+import org.crac.Context;
+import org.crac.Resource;
 
 import javax.annotation.Nonnull;
 import java.io.EOFException;
@@ -92,15 +95,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static com.hazelcast.client.config.ClientConnectionStrategyConfig.ReconnectMode.OFF;
 import static com.hazelcast.client.config.ConnectionRetryConfig.DEFAULT_CLUSTER_CONNECT_TIMEOUT_MILLIS;
@@ -123,7 +131,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 /**
  * Implementation of {@link ClientConnectionManager}.
  */
-public class TcpClientConnectionManager implements ClientConnectionManager, MembershipListener {
+public class TcpClientConnectionManager implements ClientConnectionManager, MembershipListener, Resource {
 
     private static final int DEFAULT_SMART_CLIENT_THREAD_COUNT = 3;
     private static final int EXECUTOR_CORE_POOL_SIZE = 10;
@@ -148,7 +156,7 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
     private final Set<String> labels;
     private final int outboundPortCount;
     private final boolean failoverConfigProvided;
-    private final ScheduledExecutorService executor;
+    private volatile ScheduledExecutorService executor;
     private final boolean shuffleMemberList;
     private final WaitStrategy waitStrategy;
     private final ClusterDiscoveryService clusterDiscoveryService;
@@ -161,6 +169,7 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
 
     // following fields are updated inside synchronized(clientStateMutex)
     private final Object clientStateMutex = new Object();
+    private boolean tranquilizing;
     private final ConcurrentMap<UUID, TcpClientConnection> activeConnections = new ConcurrentHashMap<>();
     private volatile UUID clusterId;
     private volatile ClientState clientState = ClientState.INITIAL;
@@ -575,6 +584,23 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
         } else if (ReconnectMode.ASYNC.equals(reconnectMode)) {
             throw new HazelcastClientOfflineException();
         } else {
+            synchronized (clientStateMutex) {
+                if (tranquilizing) {
+                    executor.submit(() -> {
+                        doConnectToCluster();
+                        synchronized (clientStateMutex) {
+                            clientStateMutex.notify();
+                        }
+                    });
+                    try {
+                        clientStateMutex.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(e);
+                    }
+                    return;
+                }
+            }
             throw new IOException("No connection found to cluster.");
         }
     }
@@ -806,10 +832,19 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
                     }
 
                     clientState = ClientState.DISCONNECTED_FROM_CLUSTER;
-                    triggerClusterReconnection();
+                    if (!tranquilizing) {
+                        triggerClusterReconnection();
+                    }
                 }
 
-                fireConnectionEvent(connection, false);
+                if (tranquilizing) {
+                    // we want to notify the listener but the executor is already down
+                    for (ConnectionListener l : connectionListeners) {
+                        l.connectionRemoved(connection);
+                    }
+                } else {
+                    fireConnectionEvent(connection, false);
+                }
             } else if (logger.isFinestEnabled()) {
                 logger.finest("Destroying a connection, but there is no mapping " + endpoint + ":" + memberUuid
                         + " -> " + connection + " in the connection map.");
@@ -959,46 +994,17 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
                 client.onConnectionToNewCluster();
             }
             checkClientState(connection, switchingToNextCluster);
+            if (tranquilizing) {
+                logger.warning("Tranquilizing, connection will be closed.");
+                connection.close("Tranquilizing before snapshot", null);
+                return connection;
+            }
 
             boolean connectionsEmpty = activeConnections.isEmpty();
             activeConnections.put(response.memberUuid, connection);
 
             if (connectionsEmpty) {
-                // The first connection that opens a connection to the new cluster should set `clusterId`.
-                // This one will initiate `initializeClientOnCluster` if necessary.
-                clusterId = newClusterId;
-                if (establishedInitialClusterConnection) {
-                    // In split brain, the client might connect to the one half
-                    // of the cluster, and then later might reconnect to the
-                    // other half, after the half it was connected to is
-                    // completely dead. Since the cluster id is preserved in
-                    // split brain scenarios, it is impossible to distinguish
-                    // reconnection to the same cluster vs reconnection to the
-                    // other half of the split brain. However, in the latter,
-                    // we might need to send some state to the other half of
-                    // the split brain (like Compact schemas or user code
-                    // deployment classes). That forces us to send the client
-                    // state to the cluster after the first cluster connection,
-                    // regardless the cluster id is changed or not.
-                    clientState = ClientState.CONNECTED_TO_CLUSTER;
-                    executor.execute(() -> {
-                        initializeClientOnCluster(newClusterId);
-                        /*
-                          We send statistics to the new cluster immediately to make clientVersion, isEnterprise and some other
-                          fields available in Management Center as soon as possible. They are currently sent as part of client
-                          statistics.
-
-                          This method is called here instead of above on purpose because sending statistics require an active
-                          connection to exist. Also, the client needs to be initialized on the new cluster in order for
-                          invocations to be allowed.
-                         */
-                        client.collectAndSendStatsNow();
-                    });
-                } else {
-                    establishedInitialClusterConnection = true;
-                    clientState = ClientState.INITIALIZED_ON_CLUSTER;
-                    fireLifecycleEvent(LifecycleState.CLIENT_CONNECTED);
-                }
+                onFirstConnection(newClusterId);
             }
 
             logger.info("Authenticated with server " + response.address + ":" + response.memberUuid
@@ -1017,6 +1023,44 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
             onConnectionClose(connection);
         }
         return connection;
+    }
+
+    private void onFirstConnection(UUID newClusterId) {
+        // The first connection that opens a connection to the new cluster should set `clusterId`.
+        // This one will initiate `initializeClientOnCluster` if necessary.
+        clusterId = newClusterId;
+        if (establishedInitialClusterConnection) {
+            // In split brain, the client might connect to the one half
+            // of the cluster, and then later might reconnect to the
+            // other half, after the half it was connected to is
+            // completely dead. Since the cluster id is preserved in
+            // split brain scenarios, it is impossible to distinguish
+            // reconnection to the same cluster vs reconnection to the
+            // other half of the split brain. However, in the latter,
+            // we might need to send some state to the other half of
+            // the split brain (like Compact schemas or user code
+            // deployment classes). That forces us to send the client
+            // state to the cluster after the first cluster connection,
+            // regardless the cluster id is changed or not.
+            clientState = ClientState.CONNECTED_TO_CLUSTER;
+            executor.execute(() -> {
+                initializeClientOnCluster(newClusterId);
+                /*
+                  We send statistics to the new cluster immediately to make clientVersion, isEnterprise and some other
+                  fields available in Management Center as soon as possible. They are currently sent as part of client
+                  statistics.
+
+                  This method is called here instead of above on purpose because sending statistics require an active
+                  connection to exist. Also, the client needs to be initialized on the new cluster in order for
+                  invocations to be allowed.
+                 */
+                client.collectAndSendStatsNow();
+            });
+        } else {
+            establishedInitialClusterConnection = true;
+            clientState = ClientState.INITIALIZED_ON_CLUSTER;
+            fireLifecycleEvent(LifecycleState.CLIENT_CONNECTED);
+        }
     }
 
     /**
@@ -1211,6 +1255,39 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
         }
     }
 
+    @Override
+    public synchronized void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        // We try to prevent further submissions to the executor we will shut down.
+        // While we don't have a proper Read-Copy-Update the worst case is some tasks
+        // being rejected.
+        ScheduledExecutorService oldExecutor = executor;
+        executor = new BlockingExecutorService(() -> executor);
+        synchronized (clientStateMutex) {
+            tranquilizing = true;
+        }
+        oldExecutor.shutdown();
+        for (TcpClientConnection c : activeConnections.values()) {
+            c.close("Tranquilizing before snapshot", null);
+        }
+        stopNetworking();
+        if (!oldExecutor.awaitTermination(ClientExecutionServiceImpl.TERMINATE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            throw new CheckpointException("Cannot shut down executor in 30 seconds");
+        }
+    }
+
+    @Override
+    public synchronized void afterRestore(Context<? extends Resource> context) throws Exception {
+        BlockingExecutorService blockingExecutor = (BlockingExecutorService) executor;
+        startNetworking();
+        executor = createExecutorService();
+        synchronized (clientStateMutex) {
+            tranquilizing = false;
+        }
+        blockingExecutor.makeReady();
+        submitConnectToClusterTask();
+        tryConnectToAllClusterMembers(false);
+    }
+
     /**
      * Schedules a task to open a connection if there is no connection for the member in the member list
      */
@@ -1279,6 +1356,87 @@ public class TcpClientConnectionManager implements ClientConnectionManager, Memb
             connection.close(null,
                     new TargetDisconnectedException("The client has closed the connection to this member,"
                             + " after receiving a member left event from the cluster. " + connection));
+        }
+    }
+
+    private static final class BlockingExecutorService extends AbstractExecutorService implements ScheduledExecutorService {
+        private final CountDownLatch latch = new CountDownLatch(1);
+        private final Supplier<ScheduledExecutorService> supplier;
+        private ScheduledExecutorService delegate;
+
+        private BlockingExecutorService(Supplier<ScheduledExecutorService> supplier) {
+            this.supplier = supplier;
+        }
+
+        private void awaitReady() {
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        private void makeReady() {
+            delegate = supplier.get();
+            latch.countDown();
+        }
+
+        @Override
+        public void execute(Runnable runnable) {
+            awaitReady();
+            delegate.execute(runnable);
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable runnable, long delay, TimeUnit unit) {
+            awaitReady();
+            return delegate.schedule(runnable, delay, unit);
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+            awaitReady();
+            return delegate.schedule(callable, delay, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable runnable, long initialDelay, long period, TimeUnit unit) {
+            awaitReady();
+            return delegate.scheduleAtFixedRate(runnable, initialDelay, period, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable runnable, long initialDelay, long period, TimeUnit unit) {
+            awaitReady();
+            return delegate.scheduleWithFixedDelay(runnable, initialDelay, period, unit);
+        }
+
+        @Override
+        public void shutdown() {
+            awaitReady();
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            awaitReady();
+            return delegate.shutdownNow();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return false;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return false;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            awaitReady();
+            return delegate.awaitTermination(timeout, unit);
         }
     }
 }

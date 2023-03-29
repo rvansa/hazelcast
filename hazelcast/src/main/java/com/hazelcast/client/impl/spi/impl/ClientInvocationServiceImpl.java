@@ -34,11 +34,14 @@ import com.hazelcast.spi.impl.sequence.CallIdFactory;
 import com.hazelcast.spi.impl.sequence.CallIdSequence;
 import com.hazelcast.spi.properties.HazelcastProperties;
 import com.hazelcast.spi.properties.HazelcastProperty;
+import org.crac.Context;
+import org.crac.Resource;
 
 import java.io.IOException;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.function.Consumer;
 
 import static com.hazelcast.client.properties.ClientProperty.BACKPRESSURE_BACKOFF_TIMEOUT_MILLIS;
@@ -54,7 +57,7 @@ import static com.hazelcast.internal.metrics.MetricDescriptorConstants.CLIENT_PR
 import static com.hazelcast.internal.metrics.ProbeLevel.MANDATORY;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
-public class ClientInvocationServiceImpl implements ClientInvocationService {
+public class ClientInvocationServiceImpl implements ClientInvocationService, Resource {
 
     private static final ListenerMessageCodec BACKUP_LISTENER = new ListenerMessageCodec() {
         @Override
@@ -97,6 +100,7 @@ public class ClientInvocationServiceImpl implements ClientInvocationService {
     private final ClientConnectionManager connectionManager;
     private final ClientPartitionService partitionService;
     private final boolean isSmartRoutingEnabled;
+    private ScheduledFuture<?> backupTaskFuture;
 
     public ClientInvocationServiceImpl(HazelcastClientInstanceImpl client) {
         this.client = client;
@@ -158,10 +162,14 @@ public class ClientInvocationServiceImpl implements ClientInvocationService {
 
     public void start() {
         responseHandlerSupplier.start();
+        startBackupTask();
+    }
+
+    private void startBackupTask() {
         if (isBackupAckToClientEnabled) {
             TaskScheduler executionService = client.getTaskScheduler();
             long cleanResourcesMillis = client.getProperties().getPositiveMillisOrDefault(CLEAN_RESOURCES_MILLIS);
-            executionService.scheduleWithRepetition(new BackupTimeoutTask(), cleanResourcesMillis,
+            backupTaskFuture = executionService.scheduleWithRepetition(new BackupTimeoutTask(), cleanResourcesMillis,
                     cleanResourcesMillis, MILLISECONDS);
         }
     }
@@ -330,6 +338,18 @@ public class ClientInvocationServiceImpl implements ClientInvocationService {
 
     public boolean isSmartRoutingEnabled() {
         return isSmartRoutingEnabled;
+    }
+
+    @Override
+    public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        if (backupTaskFuture != null) {
+            backupTaskFuture.cancel(false);
+        }
+    }
+
+    @Override
+    public void afterRestore(Context<? extends Resource> context) throws Exception {
+        startBackupTask();
     }
 
     private class BackupTimeoutTask implements Runnable {

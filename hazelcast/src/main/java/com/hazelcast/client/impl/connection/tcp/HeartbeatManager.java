@@ -27,6 +27,7 @@ import com.hazelcast.spi.exception.TargetDisconnectedException;
 import com.hazelcast.spi.impl.executionservice.TaskScheduler;
 
 import java.util.Collection;
+import java.util.concurrent.ScheduledFuture;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
@@ -36,6 +37,8 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  * is closed with  {@link TargetDisconnectedException}.
  */
 public final class HeartbeatManager {
+
+    private static ScheduledFuture<?> heartbeatFuture;
 
     private HeartbeatManager() {
 
@@ -47,7 +50,7 @@ public final class HeartbeatManager {
                              long heartbeatIntervalMillis,
                              long heartbeatTimeoutMillis,
                              Collection<Connection> unmodifiableActiveConnections) {
-        taskScheduler.scheduleWithRepetition(() -> {
+        heartbeatFuture = taskScheduler.scheduleWithRepetition(() -> {
             long now = Clock.currentTimeMillis();
             for (Connection connection : unmodifiableActiveConnections) {
                 if (!connection.isAlive()) {
@@ -68,6 +71,12 @@ public final class HeartbeatManager {
                 }
             }
         }, heartbeatIntervalMillis, heartbeatIntervalMillis, MILLISECONDS);
+    }
+
+    public static void stop() {
+        if (heartbeatFuture != null) {
+            heartbeatFuture.cancel(false);
+        }
     }
 
 }

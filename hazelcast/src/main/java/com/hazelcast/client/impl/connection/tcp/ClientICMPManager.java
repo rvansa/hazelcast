@@ -27,6 +27,7 @@ import com.hazelcast.spi.impl.executionservice.TaskScheduler;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import static com.hazelcast.internal.util.EmptyStatement.ignore;
@@ -42,6 +43,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 public final class ClientICMPManager {
 
     private static final long MIN_ICMP_INTERVAL_MILLIS = SECONDS.toMillis(1);
+    private static ScheduledFuture<?> pingFuture;
 
     private ClientICMPManager() {
     }
@@ -74,7 +76,7 @@ public final class ClientICMPManager {
         }
 
         PingFailureDetector<Connection> failureDetector = new PingFailureDetector<>(icmpMaxAttempts);
-        taskScheduler.scheduleWithRepetition(() -> {
+        pingFuture = taskScheduler.scheduleWithRepetition(() -> {
             failureDetector.retainAttemptsForAliveEndpoints(unmodifiableActiveConnections);
             for (Connection connection : unmodifiableActiveConnections) {
                 // we don't want an isReachable call to an address stopping us to check other addresses.
@@ -82,6 +84,12 @@ public final class ClientICMPManager {
                 taskScheduler.execute(() -> ping(logger, failureDetector, connection, icmpTtl, icmpTimeoutMillis));
             }
         }, icmpIntervalMillis, icmpIntervalMillis, TimeUnit.MILLISECONDS);
+    }
+
+    public static void stop() {
+        if (pingFuture != null) {
+            pingFuture.cancel(false);
+        }
     }
 
     private static void echoFailFast(ILogger logger) {

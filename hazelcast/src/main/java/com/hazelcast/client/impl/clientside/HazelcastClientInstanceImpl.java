@@ -138,6 +138,9 @@ import com.hazelcast.transaction.TransactionException;
 import com.hazelcast.transaction.TransactionOptions;
 import com.hazelcast.transaction.TransactionalTask;
 import com.hazelcast.transaction.impl.xa.XAService;
+import org.crac.Context;
+import org.crac.Core;
+import org.crac.Resource;
 
 import javax.annotation.Nonnull;
 import java.net.InetSocketAddress;
@@ -172,7 +175,7 @@ import static com.hazelcast.internal.util.Preconditions.checkNotNull;
 import static java.lang.System.currentTimeMillis;
 import static java.util.Collections.unmodifiableSet;
 
-public class HazelcastClientInstanceImpl implements HazelcastInstance, SerializationServiceSupport {
+public class HazelcastClientInstanceImpl implements HazelcastInstance, SerializationServiceSupport, Resource {
 
     private static final AtomicInteger CLIENT_ID = new AtomicInteger();
 
@@ -232,15 +235,7 @@ public class HazelcastClientInstanceImpl implements HazelcastInstance, Serializa
         this.loggingService = new ClientLoggingService(config.getClusterName(),
                 loggingType, BuildInfoProvider.getBuildInfo(), instanceName, detailsEnabled);
 
-        if (clientConfig != null) {
-            MetricsConfigHelper.overrideClientMetricsConfig(clientConfig,
-                    getLoggingService().getLogger(MetricsConfigHelper.class));
-        } else {
-            for (ClientConfig failoverClientConfig : clientFailoverConfig.getClientConfigs()) {
-                MetricsConfigHelper.overrideClientMetricsConfig(failoverClientConfig,
-                        getLoggingService().getLogger(MetricsConfigHelper.class));
-            }
-        }
+        overrideClientMetricsConfig(clientConfig, clientFailoverConfig);
 
         ClassLoader classLoader = config.getClassLoader();
         properties = new HazelcastProperties(config.getProperties());
@@ -274,6 +269,20 @@ public class HazelcastClientInstanceImpl implements HazelcastInstance, Serializa
         proxySessionManager = new ClientProxySessionManager(this);
         cpSubsystem = new CPSubsystemImpl(this);
         sqlService = new SqlClientService(this);
+
+        Core.getGlobalContext().register(this);
+    }
+
+    private void overrideClientMetricsConfig(ClientConfig clientConfig, ClientFailoverConfig clientFailoverConfig) {
+        if (clientConfig != null) {
+            MetricsConfigHelper.overrideClientMetricsConfig(clientConfig,
+                    getLoggingService().getLogger(MetricsConfigHelper.class));
+        } else {
+            for (ClientConfig failoverClientConfig : clientFailoverConfig.getClientConfigs()) {
+                MetricsConfigHelper.overrideClientMetricsConfig(failoverClientConfig,
+                        getLoggingService().getLogger(MetricsConfigHelper.class));
+            }
+        }
     }
 
     private ConcurrencyDetection initConcurrencyDetection() {
@@ -960,5 +969,19 @@ public class HazelcastClientInstanceImpl implements HazelcastInstance, Serializa
 
     public SchemaService getSchemaService() {
         return schemaService;
+    }
+
+    @Override
+    public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        HeartbeatManager.stop();
+        ClientICMPManager.stop();
+        connectionManager.beforeCheckpoint(context);
+    }
+
+    @Override
+    public void afterRestore(Context<? extends Resource> context) throws Exception {
+        connectionManager.afterRestore(context);
+        startIcmpPing();
+        startHeartbeat();
     }
 }
